@@ -287,6 +287,9 @@ app.post('/api/chat', async (req, res, next) => {
         });
 
         if (!response.ok) {
+          if (response.status === 401) {
+            throw new Error("⚠️ API Authentication Error: The configured GEMINI_API_KEY is invalid, expired, or truncated. Please verify your API Key in Google AI Studio and update your environment variables.");
+          }
           const errData = await response.json().catch(() => ({}));
           throw new Error(errData.error?.message || `HTTP ${response.status}`);
         }
