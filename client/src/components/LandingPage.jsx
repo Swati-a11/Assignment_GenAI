@@ -142,7 +142,7 @@ export default function LandingPage() {
       }}>
         <div className="flex items-center space-x-2 cursor-pointer select-none">
           <GraduationCap className="h-6 w-6 text-amber-500" />
-          <span className="font-bold text-lg tracking-tight select-none">CodeMentor AI</span>
+          <span className="font-bold text-lg tracking-tight select-none">AI Mentors</span>
         </div>
 
         <div className="flex items-center space-x-6">
@@ -301,7 +301,7 @@ export default function LandingPage() {
 
       {/* Footer */}
       <footer className="text-center text-[11px] font-mono text-zinc-400 dark:text-zinc-650 py-10 border-t dark:border-white/[0.04] border-zinc-200 bg-black/[0.01] dark:bg-black/30 mt-auto">
-        CodeMentor AI • Created for the AI Mentor Challenge
+        AI Mentors • Created for the AI Mentor Challenge
       </footer>
     </div>
   );

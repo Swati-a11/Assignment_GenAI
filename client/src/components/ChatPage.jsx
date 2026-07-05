@@ -225,7 +225,7 @@ export default function ChatPage() {
 
           <div className="flex items-center space-x-2 select-none">
             <GraduationCap className="h-5 w-5 text-amber-500" />
-            <span className="font-bold text-sm tracking-tight hidden xs:inline">CodeMentor AI</span>
+            <span className="font-bold text-sm tracking-tight hidden xs:inline">AI Mentors</span>
             <span className="text-[10px] opacity-40 font-mono tracking-widest">/ {mentorKey === 'hitesh' ? 'Hitesh' : 'Piyush'}</span>
           </div>
         </div>
@@ -446,7 +446,7 @@ export default function ChatPage() {
             className="flex items-center space-x-2 select-none cursor-pointer hover:opacity-85 transition duration-200"
           >
             <GraduationCap className="h-4.5 w-4.5 text-amber-500" />
-            <span className="font-bold text-sm tracking-tight">CodeMentor AI</span>
+            <span className="font-bold text-sm tracking-tight">AI Mentors</span>
             <span className="h-2 w-2 rounded-full bg-green-500 animate-pulse ml-1"></span>
           </div>
 
