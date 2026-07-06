@@ -1,71 +1,129 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import mongoose from 'mongoose';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
-import { ChatSession } from './models/Chat.js';
 
-// 1. Resolve path helpers for ES Modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// 2. Load environment variables via dotenv
+// 1. Load environment variables via dotenv
 dotenv.config();
 
-// 3. Initialize Express
+// 2. Initialize Express
 const app = express();
 
-// 4. Configure CORS & Body Parser Middleware
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
-  ? process.env.ALLOWED_ORIGINS.split(',') 
+// 3. Configure CORS & Body Parser Middleware
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
   : ['http://localhost:5173', 'http://127.0.0.1:5173'];
 
 app.use(cors({
   origin: (origin, callback) => {
     // Allow request if no origin is specified (like curl, postman, server-to-server)
     if (!origin) return callback(null, true);
-    
-    const isAllowed = allowedOrigins.includes(origin) || origin.endsWith('.vercel.app');
-    if (isAllowed) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+
+    // Check if the origin matches the configured allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
+
+    // Safely allow localhost development origins
+    if (/^https?:\/\/localhost(:\d+)?$/.test(origin) || /^https?:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) {
+      return callback(null, true);
+    }
+
+    // Safely match and allow Vercel subdomains (e.g. your-app.vercel.app)
+    try {
+      const parsedUrl = new URL(origin);
+      if (parsedUrl.hostname === 'vercel.app' || parsedUrl.hostname.endsWith('.vercel.app')) {
+        return callback(null, true);
+      }
+    } catch (e) {
+      // Ignore URL parsing exceptions
+    }
+
+    // Reject other origins gracefully without throwing server-side trace errors
+    callback(null, false);
   },
-  credentials: true
+  credentials: true,
+  optionsSuccessStatus: 200
 }));
 
-app.use(express.json());
+// Ensure OPTIONS preflight requests are intercepted and handled at the top
+app.options('*', cors());
 
-// 5. Retrieve Environment configurations
-const PORT = process.env.PORT || 5001;
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/gemini-simulation-chat';
+// Request logging middleware for improved server observability
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// Configure JSON and URL-encoded parsers with payload limits (prevents DoS)
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// 4. Retrieve Environment configurations
+const PORT = parseInt(process.env.PORT || '5001', 10);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// 6. Connect to database with grace-fallback
-let isMongoConnected = false;
+// 5. Memory Fallback Cache Setup (In-Memory Map)
 const inMemorySessions = new Map();
+const MAX_IN_MEMORY_SESSIONS = 500;
 
-async function connectDB() {
-  if (!MONGO_URI) {
-    console.log('ℹ️ Running on In-Memory Optimization Mode (Local Engine Active)');
-    return;
+// Eviction utility to prevent memory leaks in the Map cache
+function saveInMemorySession(sessionId, session) {
+  if (inMemorySessions.size >= MAX_IN_MEMORY_SESSIONS && !inMemorySessions.has(sessionId)) {
+    const oldestKey = inMemorySessions.keys().next().value;
+    inMemorySessions.delete(oldestKey);
   }
-  try {
-    await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 2000 });
-    isMongoConnected = true;
-    console.log('🔌 Connected to MongoDB successfully.');
-  } catch (error) {
-    isMongoConnected = false;
-    console.log('ℹ️ Running on In-Memory Optimization Mode (Local Engine Active)');
-  }
+  inMemorySessions.set(sessionId, session);
 }
 
-connectDB();
+// Helper: Resolve active chat session from Memory
+async function getSession(sessionId, persona) {
+  let session = inMemorySessions.get(sessionId);
+  if (!session && persona) {
+    session = {
+      sessionId,
+      persona,
+      createdAt: new Date(),
+      messages: [{
+        role: 'model',
+        parts: [{ text: WELCOME_MESSAGES[persona] }],
+        timestamp: new Date()
+      }]
+    };
+    saveInMemorySession(sessionId, session);
+  }
+  return session;
+}
 
-// 7. Initialize Google Gemini AI Engine
+// Helper: Persist session modifications
+async function saveSession(session) {
+  saveInMemorySession(session.sessionId, session);
+}
+
+// Helper: Enforce alternating roles structure required by the Gemini API
+function sanitizeHistoryForGemini(messages) {
+  const sanitized = [];
+  for (const msg of messages) {
+    const role = msg.role === 'model' ? 'model' : 'user';
+    const text = msg.parts?.[0]?.text || '';
+    if (!text) continue;
+
+    if (sanitized.length === 0) {
+      sanitized.push({ role, parts: [{ text }] });
+    } else {
+      const last = sanitized[sanitized.length - 1];
+      if (last.role !== role) {
+        sanitized.push({ role, parts: [{ text }] });
+      } else {
+        // Merge texts of contiguous blocks of same role to avoid role misalignment errors
+        last.parts[0].text += '\n' + text;
+      }
+    }
+  }
+  return sanitized;
+}
+
+// 6. Initialize Google Gemini AI Engine
 let aiClient = null;
 if (GEMINI_API_KEY) {
   try {
@@ -78,7 +136,7 @@ if (GEMINI_API_KEY) {
   console.warn('⚠️ GEMINI_API_KEY is not defined. The app will run in Demo/Fallback mode.');
 }
 
-// 8. Persona configurations and welcome cues
+// 7. Persona configurations and welcome cues
 const SYSTEM_PROMPTS = {
   hitesh: `You are Hitesh Choudhary, a mature, calm, patient, and deeply encouraging tech mentor and creator of 'Chai aur Code'. Your communication style is composed, reassuring, and highly welcoming, speaking like a supportive elder brother. Start conversations naturally with an easy-going vibe like 'Hey everyone, back again...' or 'Ek cup chai lelo, aur sukoon se samajhte hain...'. You never rush. You focus on building concepts step-by-step, emphasizing that coding is easy if you understand the core process. Avoid aggressive hype. Use phrases like 'chill maro', 'production-ready code', 'practical integration', and 'bohot simple hai, dhyan se suno'. Never break character. Do not state you are an AI.`,
   piyush: `You are an AI Programming Mentor inspired by the public teaching style of Piyush Garg. You are NOT the real Piyush Garg and should never claim to be. Instead, you are an original AI mentor whose communication style is inspired by his educational content.
@@ -133,7 +191,7 @@ Whenever explaining complex topics, compare them with real-world situations (e.g
 When generating code, first explain:
 - Why we're writing it
 - What problem it solves
-Then provide:
+- Then provide:
 - Clean, readable, modular, and production-quality code.
 After the code explain:
 - Important sections
@@ -185,51 +243,7 @@ const WELCOME_MESSAGES = {
   piyush: "Yo guys! Ready to deep dive under the hood? Let's break down systems and build high-performance infrastructure. Drop your tech queries!"
 };
 
-// Helper: Resolve active chat session from DB or Memory
-async function getSession(sessionId, persona) {
-  if (isMongoConnected) {
-    let session = await ChatSession.findOne({ sessionId });
-    if (!session && persona) {
-      session = new ChatSession({
-        sessionId,
-        persona,
-        messages: [{
-          role: 'model',
-          parts: [{ text: WELCOME_MESSAGES[persona] }],
-          timestamp: new Date()
-        }]
-      });
-      await session.save();
-    }
-    return session;
-  } else {
-    let session = inMemorySessions.get(sessionId);
-    if (!session && persona) {
-      session = {
-        sessionId,
-        persona,
-        createdAt: new Date(),
-        messages: [{
-          role: 'model',
-          parts: [{ text: WELCOME_MESSAGES[persona] }],
-          timestamp: new Date()
-        }]
-      };
-      inMemorySessions.set(sessionId, session);
-    }
-    return session;
-  }
-}
-
-async function saveSession(session) {
-  if (isMongoConnected) {
-    await session.save();
-  } else {
-    inMemorySessions.set(session.sessionId, session);
-  }
-}
-
-// 9. API Endpoint Routes
+// 8. API Endpoint Routes
 
 // Route 1: Post Chat Message
 app.post('/api/chat', async (req, res, next) => {
@@ -245,60 +259,50 @@ app.post('/api/chat', async (req, res, next) => {
 
   try {
     const session = await getSession(sessionId, persona);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
     const history = session.messages;
 
-    // Duplication check to prevent double submissions
-    const isDuplicate = history.length > 0 && 
-                        history[history.length - 1].role === 'user' && 
-                        history[history.length - 1].parts[0].text === message;
+    // Duplication check to prevent double submissions from double clicks or network retry storms
+    const lastMessage = history[history.length - 1];
+    const lastMessageIsUser = lastMessage && lastMessage.role === 'user';
+    const isSameText = lastMessage && lastMessage.parts?.[0]?.text === message;
+    const isDuplicate = lastMessageIsUser && isSameText;
 
+    // Sanitize chat history mapping to ensure strict alternation of user/model messages
+    const geminiHistory = sanitizeHistoryForGemini(history);
+
+    // If it isn't a duplicate, add the user message into the input array for Gemini call
     if (!isDuplicate) {
-      history.push({
+      geminiHistory.push({
         role: 'user',
-        parts: [{ text: message }],
-        timestamp: new Date()
+        parts: [{ text: message }]
       });
     }
 
-    const geminiHistory = history.map(msg => ({
-      role: msg.role,
-      parts: msg.parts.map(p => ({ text: p.text }))
-    }));
-
     let replyText = '';
 
-    if (GEMINI_API_KEY) {
+    if (GEMINI_API_KEY && aiClient) {
       try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            contents: geminiHistory,
-            systemInstruction: {
-              parts: [{ text: SYSTEM_PROMPTS[persona] }]
-            },
-            generationConfig: {
-              temperature: 0.7
-            }
-          })
+        const response = await aiClient.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: geminiHistory,
+          config: {
+            systemInstruction: SYSTEM_PROMPTS[persona],
+            temperature: 0.7
+          }
         });
 
-        if (!response.ok) {
-          if (response.status === 401) {
-            throw new Error("⚠️ API Authentication Error: The configured GEMINI_API_KEY is invalid, expired, or truncated. Please verify your API Key in Google AI Studio and update your environment variables.");
-          }
-          const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.error?.message || `HTTP ${response.status}`);
-        }
-
-        const data = await response.json();
-        replyText = data.candidates?.[0]?.content?.parts?.[0]?.text || "I couldn't process that.";
+        replyText = response.text || "I couldn't process that.";
       } catch (geminiError) {
         console.error('❌ Gemini Generation Error:', geminiError);
-        replyText = `[API Error: ${geminiError.message || 'Failed to generate response'}]`;
+        // Respond with 502 Bad Gateway. Do not save user message to database to prevent polluting history.
+        return res.status(502).json({
+          error: 'Gemini Generation Failed',
+          details: geminiError.message || 'Failed to generate response from Google Gen AI'
+        });
       }
     } else {
       // Demo mode fallback answers
@@ -309,7 +313,17 @@ app.post('/api/chat', async (req, res, next) => {
       }
     }
 
-    history.push({
+    // Only commit user message to session memory if it was not already stored
+    if (!isDuplicate) {
+      session.messages.push({
+        role: 'user',
+        parts: [{ text: message }],
+        timestamp: new Date()
+      });
+    }
+
+    // Add model reply and save session safely
+    session.messages.push({
       role: 'model',
       parts: [{ text: replyText }],
       timestamp: new Date()
@@ -317,9 +331,9 @@ app.post('/api/chat', async (req, res, next) => {
 
     await saveSession(session);
 
-    res.json({
+    res.status(200).json({
       reply: replyText,
-      history: history
+      history: session.messages
     });
 
   } catch (error) {
@@ -330,24 +344,14 @@ app.post('/api/chat', async (req, res, next) => {
 // Route 2: Get All Active Chat Sessions
 app.get('/api/sessions', async (req, res, next) => {
   try {
-    let sessionsList = [];
-    if (isMongoConnected) {
-      const dbSessions = await ChatSession.find({}, { messages: { $slice: -1 } }).sort({ createdAt: -1 });
-      sessionsList = dbSessions.map(s => ({
-        sessionId: s.sessionId,
-        persona: s.persona,
-        createdAt: s.createdAt,
-        lastMessage: s.messages[0] ? s.messages[0].parts[0].text : ''
-      }));
-    } else {
-      sessionsList = Array.from(inMemorySessions.values()).map(s => ({
-        sessionId: s.sessionId,
-        persona: s.persona,
-        createdAt: s.createdAt,
-        lastMessage: s.messages[s.messages.length - 1] ? s.messages[s.messages.length - 1].parts[0].text : ''
-      })).sort((a, b) => b.createdAt - a.createdAt);
-    }
-    res.json(sessionsList);
+    const sessionsList = Array.from(inMemorySessions.values()).map(s => ({
+      sessionId: s.sessionId,
+      persona: s.persona,
+      createdAt: s.createdAt,
+      lastMessage: s.messages[s.messages.length - 1] ? s.messages[s.messages.length - 1].parts[0].text : ''
+    })).sort((a, b) => b.createdAt - a.createdAt);
+
+    res.status(200).json(sessionsList);
   } catch (error) {
     next(error);
   }
@@ -359,8 +363,12 @@ app.get('/api/session/:sessionId', async (req, res, next) => {
   const { persona } = req.query;
 
   try {
-    const session = await getSession(sessionId, persona || 'hitesh');
-    res.json(session);
+    // If no persona, check if session already exists
+    const session = await getSession(sessionId, persona || null);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found. Provide persona to initialize a new session.' });
+    }
+    res.status(200).json(session);
   } catch (error) {
     next(error);
   }
@@ -370,12 +378,13 @@ app.get('/api/session/:sessionId', async (req, res, next) => {
 app.delete('/api/session/:sessionId', async (req, res, next) => {
   const { sessionId } = req.params;
   try {
-    if (isMongoConnected) {
-      await ChatSession.deleteOne({ sessionId });
-    } else {
-      inMemorySessions.delete(sessionId);
+    const exists = inMemorySessions.has(sessionId);
+    if (!exists) {
+      return res.status(404).json({ error: 'Session not found.' });
     }
-    res.json({ success: true, message: 'Session deleted successfully.' });
+
+    inMemorySessions.delete(sessionId);
+    res.status(200).json({ success: true, message: 'Session deleted successfully.' });
   } catch (error) {
     next(error);
   }
@@ -384,6 +393,10 @@ app.delete('/api/session/:sessionId', async (req, res, next) => {
 // Route 5: Clear Session Messages
 app.post('/api/session/clear', async (req, res, next) => {
   const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Missing required parameter: sessionId' });
+  }
+
   try {
     const session = await getSession(sessionId);
     if (session) {
@@ -393,7 +406,7 @@ app.post('/api/session/clear', async (req, res, next) => {
         timestamp: new Date()
       }];
       await saveSession(session);
-      res.json({ success: true, history: session.messages });
+      res.status(200).json({ success: true, history: session.messages });
     } else {
       res.status(404).json({ error: 'Session not found.' });
     }
@@ -404,17 +417,29 @@ app.post('/api/session/clear', async (req, res, next) => {
 
 // Route 6: Server Health Diagnostics
 app.get('/api/health', (req, res) => {
-  res.json({
+  res.status(200).json({
     status: 'ok',
-    database: isMongoConnected ? 'connected' : 'in-memory (fallback)',
+    database: 'none (in-memory session store)',
     gemini: aiClient ? 'configured' : 'demo-mode (missing key)'
   });
 });
 
-// 10. Global Error Handling Middleware
+// 9. Global Error Handling Middleware
 app.use((err, req, res, next) => {
   console.error('❌ Express Server Error Context:', err.stack || err);
-  res.status(500).json({ error: 'Internal Server Error' });
+  const status = err.statusCode || 500;
+  res.status(status).json({
+    error: err.message || 'Internal Server Error'
+  });
+});
+
+// 10. Process Level Exception Catchers to Prevent Crashes
+process.on('uncaughtException', (error) => {
+  console.error('💥 Uncaught Exception caught at process level:', error.stack || error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 // 11. Run Server
